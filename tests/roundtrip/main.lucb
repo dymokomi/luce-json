@@ -1,0 +1,19 @@
+import json
+import memory
+
+pub func main(arguments: str[]) -> i32!:
+    with memory.heap:
+        let obj = try new json.Value()
+        defer free(obj)
+        defer obj.close()
+        try obj.set_integer("count", 42)
+        try obj.set_text("name", "luce")
+        let encoded = obj.encode()
+        print(encoded)
+        let doc = try json.decode(encoded)
+        defer doc.release()
+        let root = (try doc.get()).root()
+        let count = (root.member("count") else trap("count")).integer() else -1
+        let name = (root.member("name") else trap("name")).text() else ""
+        print(f"count={count} name={name}")
+    return 0

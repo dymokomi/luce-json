@@ -1,0 +1,6 @@
+[package]
+name = "luce_json"
+source = "src"
+
+[exports]
+json = "luce_json.json"

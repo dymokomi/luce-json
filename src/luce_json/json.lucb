@@ -1,0 +1,779 @@
+#==============================================================================================
+#
+#   json - Structured JSON values
+#
+#   DESCRIPTION:
+#       Structured JSON values own their UTF-8 encoding. Containers snapshot inserted values:
+#       later changes to a child do not mutate its parent or create ARC cycles. No API accepts
+#       unchecked JSON fragments. All growth is bounded and transactional.
+#
+#==============================================================================================
+
+import memory
+import interop
+import strings
+import utf8
+import math
+## A JSON operation with an invalid argument or shape.
+pub let invalid: ErrorCode = ErrorCode.package(110)
+## A JSON value grown past its configured byte limit.
+pub let limit_exceeded: ErrorCode = ErrorCode.package(111)
+
+struct Bytes:
+    var storage: u8[]
+    var used: usize
+
+    mutating func reserve(count: usize, maximum: usize) -> !:
+        if count > maximum:
+            error(limit_exceeded, "JSON exceeds its configured byte limit")
+        if count <= self.storage.length:
+            return
+        var capacity: usize = 64 if self.storage.length == 0 else self.storage.length
+        while capacity < count:
+            capacity = maximum if capacity > maximum // 2 else capacity * 2
+        if capacity > maximum:
+            capacity = maximum
+        let data = try alloc u8[capacity] in memory.heap
+        memory.copy(data, self.storage, self.used)
+        if self.storage.length > 0:
+            free(self.storage) in memory.heap
+        self.storage = data
+
+    mutating func append(data: const u8[], maximum: usize) -> !:
+        let needed = self.used +? data.length else error(limit_exceeded, "JSON size overflow")
+        try self.reserve(needed, maximum)
+        memory.copy(self.storage[self.used..], data, data.length)
+        self.used = needed
+
+    func view() -> const u8[]:
+        return self.storage[..<self.used]
+
+    mutating func close():
+        if self.storage.length > 0:
+            free(self.storage) in memory.heap
+        var empty: u8[]
+        self.storage = empty
+        self.used = 0
+
+func quoted(value: str, output: Bytes*, maximum: usize) -> !:
+    var decoder: utf8.Decoder
+    for byte in value.bytes:
+        discard(try decoder.push(byte))
+    try decoder.finish()
+    try output.append(b"\"", maximum)
+    for byte in value.bytes:
+        if byte == '"' or byte == '\\':
+            let pair: u8[2] = ['\\', byte]
+            try output.append(pair, maximum)
+        elif byte < 32:
+            let digits = "0123456789abcdef".bytes
+            let escaped: u8[6] = ['\\', 'u', '0', '0', digits[(usize)(byte >> 4)], digits[(usize)(byte & 15)]]
+            try output.append(escaped, maximum)
+        else:
+            let single: u8[1] = [byte]
+            try output.append(single, maximum)
+    try output.append(b"\"", maximum)
+
+# mark: JSON values ===========================================================================
+
+## Value() creates an object. Arrays and scalar values use the named constructors.
+## Base copies borrow; an exported Value has normal shared interop ownership.
+pub struct Value:
+    var encoded: Bytes
+    var keys: Bytes
+    var container: u8 = '{'
+    var count: usize
+    var maximum: usize = 1048576
+
+    ## Initialise as an empty object with a byte limit.
+    pub func init(maximum_bytes: usize = 1048576) -> !:
+        if maximum_bytes < 2 or maximum_bytes > 67108864:
+            error(invalid, "JSON byte limit must be between 2 and 64 MiB")
+        self.encoded = Bytes()
+        self.keys = Bytes()
+        self.container = '{'
+        self.count = 0
+        self.maximum = maximum_bytes
+        try self.encoded.append(b"{}", self.maximum)
+
+    static func own(native: Value*) -> interop.Reference[Value]!:
+        return try interop.Reference[Value].adopt(native, value_type)
+
+    ## An empty JSON array value.
+    pub static func array(maximum_bytes: usize = 1048576) -> interop.Reference[Value]!:
+        let native = try new Value(maximum_bytes)
+        native.container = '['
+        native.encoded.storage[0] = '['
+        native.encoded.storage[1] = ']'
+        return try Value.own(native)
+
+    static func scalar(data: str) -> interop.Reference[Value]!:
+        let native = try new Value()
+        native.encoded.used = 0
+        native.container = 0
+        native.encoded.append(data.bytes, native.maximum) catch failure:
+            native.close()
+            free(native)
+            error(failure.code, failure.message)
+        return try Value.own(native)
+
+    ## A JSON string value.
+    pub static func text(value: str) -> interop.Reference[Value]!:
+        var bytes: Bytes
+        defer bytes.close()
+        try quoted(value, &bytes, 1048576)
+        return try Value.scalar((str)bytes.view())
+
+    ## A JSON integer value.
+    pub static func integer(value: i64) -> interop.Reference[Value]!:
+        var buffer: u8[32]
+        return try Value.scalar(try format(buffer, f"{value}"))
+
+    ## A JSON number value; `value` must be finite.
+    pub static func number(value: f64) -> interop.Reference[Value]!:
+        if not math.is_finite(value):
+            error(invalid, "JSON numbers must be finite")
+        var buffer: u8[64]
+        return try Value.scalar(try strings.format_f64(value, buffer))
+
+    ## A JSON boolean value.
+    pub static func boolean(value: bool) -> interop.Reference[Value]!:
+        return try Value.scalar("true" if value else "false")
+
+    ## The JSON null value.
+    pub static func null() -> interop.Reference[Value]!:
+        return try Value.scalar("null")
+
+    ## Borrowed until the next mutation or close; Luce copies the result.
+    pub func encode() -> str:
+        return (str)self.encoded.view()
+
+    mutating func insert(name: str?, value: const Value*) -> !:
+        if self.container == 0 or ((self.container == '{') != (name != none)):
+            error(invalid, "JSON operation does not match the container type")
+        var key: Bytes
+        defer key.close()
+        if let key_name = name:
+            try quoted(key_name, &key, self.maximum)
+            var start: usize = 0
+            for index in 0..<self.keys.used:
+                if self.keys.storage[index] == '\n':
+                    if (str)self.keys.storage[start..<index] == (str)key.view():
+                        error(invalid, "JSON object already contains this key")
+                    start = index + 1
+        var fragment: Bytes
+        defer fragment.close()
+        if self.count > 0:
+            try fragment.append(b",", self.maximum)
+        if name != none:
+            try fragment.append(key.view(), self.maximum)
+            try fragment.append(b":", self.maximum)
+        try fragment.append(value.encoded.view(), self.maximum)
+        let size = self.encoded.used +? fragment.used else error(limit_exceeded, "JSON size overflow")
+        let key_end = self.keys.used +? key.used else error(limit_exceeded, "JSON key size overflow")
+        let key_size = key_end +? 1 else error(limit_exceeded, "JSON key size overflow")
+        # Reserve both before changing either logical value. The fragment also
+        # permits inserting a snapshot of this container into itself safely.
+        try self.encoded.reserve(size, self.maximum)
+        if name != none:
+            try self.keys.reserve(key_size, self.maximum)
+        let end = self.encoded.used - 1
+        memory.copy(self.encoded.storage[end..], fragment.view(), fragment.used)
+        self.encoded.used = size
+        self.encoded.storage[size - 1] = '}' if self.container == '{' else ']'
+        if name != none:
+            memory.copy(self.keys.storage[self.keys.used..], key.view(), key.used)
+            self.keys.used += key.used
+            self.keys.storage[self.keys.used] = '\n'
+            self.keys.used += 1
+        self.count += 1
+
+    ## Set object member `name` to a snapshot of `value`.
+    pub mutating func set(name: str, value: interop.Reference[Value]) -> !:
+        try self.insert(name, try value.get())
+
+    ## Append a snapshot of `value` to an array.
+    pub mutating func append(value: interop.Reference[Value]) -> !:
+        try self.insert(none, try value.get())
+
+    ## Set member `name` to a string.
+    pub mutating func set_text(name: str, value: str) -> !:
+        let child = try Value.text(value)
+        defer child.release()
+        try self.set(name, child)
+
+    ## Set member `name` to an integer.
+    pub mutating func set_integer(name: str, value: i64) -> !:
+        let child = try Value.integer(value)
+        defer child.release()
+        try self.set(name, child)
+
+    ## Set member `name` to a number.
+    pub mutating func set_number(name: str, value: f64) -> !:
+        let child = try Value.number(value)
+        defer child.release()
+        try self.set(name, child)
+
+    ## Set member `name` to a boolean.
+    pub mutating func set_boolean(name: str, value: bool) -> !:
+        let child = try Value.boolean(value)
+        defer child.release()
+        try self.set(name, child)
+
+    ## Release the value's storage.
+    pub mutating func close():
+        self.encoded.close()
+        self.keys.close()
+
+## The interop type of a JSON `Value`.
+pub let value_type: interop.Type[Value] = interop.Type[Value]("JSON value", Value.close, closeable = true)
+
+# mark: JSON decoding =========================================================================
+
+## The kind of a decoded JSON value.
+pub enum Kind as u8:
+    object = 0
+    array = 1
+    string = 2
+    number = 3
+    boolean = 4
+    null = 5
+
+## One node of a decoded document. Containers link their members through a pool of
+## these by index, so the pool can grow without invalidating a parent's references.
+struct Element:
+    var kind: Kind = Kind.null
+    var text_start: usize = 0
+    var text_length: usize = 0
+    var boolean: bool = false
+    var count: usize = 0
+    var first_child: usize = 0
+    var next_sibling: usize = 0
+    var has_child: bool = false
+    var has_sibling: bool = false
+    var key_start: usize = 0
+    var key_length: usize = 0
+
+## A decoded JSON document. It owns the parsed node pool and the decoded UTF-8 bytes of
+## strings, keys and numbers; every view into it is borrowed and valid until it closes.
+pub struct Document:
+    var storage: Bytes
+    var pool: Element[]
+    var used: usize = 0
+    var maximum: usize = 1048576
+
+    static func own(native: Document*) -> interop.Reference[Document]!:
+        return try interop.Reference[Document].adopt(native, document_type)
+
+    ## The root value of the document.
+    pub func root() -> View:
+        return View(document = &self, index = 0)
+
+    mutating func add(node: Element) -> usize!:
+        if self.used >= self.pool.length:
+            var capacity: usize = 16 if self.pool.length == 0 else self.pool.length * 2
+            let grown = try alloc Element[capacity] in memory.heap
+            var index: usize = 0
+            while index < self.used:
+                grown[index] = self.pool[index]
+                index += 1
+            if self.pool.length > 0:
+                free(self.pool) in memory.heap
+            self.pool = grown
+        self.pool[self.used] = node
+        self.used += 1
+        return self.used - 1
+
+    ## Release the document's storage and node pool.
+    pub mutating func close():
+        self.storage.close()
+        if self.pool.length > 0:
+            free(self.pool) in memory.heap
+        var empty: Element[]
+        self.pool = empty
+        self.used = 0
+
+## The interop type of a decoded JSON `Document`.
+pub let document_type: interop.Type[Document] = interop.Type[Document]("JSON document", Document.close, closeable = true)
+
+## A borrowed cursor over one value in a `Document`, valid until the document closes.
+pub struct View:
+    var document: const Document*
+    var index: usize
+
+    ## The kind of this value.
+    pub func kind() -> Kind:
+        return self.document.pool[self.index].kind
+
+    ## Whether this value is JSON null.
+    pub func is_null() -> bool:
+        return self.document.pool[self.index].kind == Kind.null
+
+    ## The number of members or elements; zero for a scalar.
+    pub func length() -> usize:
+        return self.document.pool[self.index].count
+
+    ## The element at `position` in an array, or none.
+    pub func at(position: usize) -> View?:
+        let node = self.document.pool[self.index]
+        if node.kind != Kind.array or position >= node.count or not node.has_child:
+            return none
+        var child = node.first_child
+        var step: usize = 0
+        while step < position:
+            let current = self.document.pool[child]
+            if not current.has_sibling:
+                return none
+            child = current.next_sibling
+            step += 1
+        return View(document = self.document, index = child)
+
+    ## The member named `name` in an object, or none.
+    pub func member(name: str) -> View?:
+        let node = self.document.pool[self.index]
+        if node.kind != Kind.object or not node.has_child:
+            return none
+        var child = node.first_child
+        while true:
+            let current = self.document.pool[child]
+            if self.slice(current.key_start, current.key_length) == name:
+                return View(document = self.document, index = child)
+            if not current.has_sibling:
+                return none
+            child = current.next_sibling
+
+    ## The decoded UTF-8 text of a string value, or none. Borrowed from the document.
+    pub func text() -> str?:
+        let node = self.document.pool[self.index]
+        if node.kind != Kind.string:
+            return none
+        return self.slice(node.text_start, node.text_length)
+
+    ## The value of a boolean, or none.
+    pub func boolean() -> bool?:
+        let node = self.document.pool[self.index]
+        return node.boolean if node.kind == Kind.boolean else none
+
+    ## A number as a 64-bit integer, or none if it is not an integer or does not fit.
+    pub func integer() -> i64?:
+        let node = self.document.pool[self.index]
+        if node.kind != Kind.number:
+            return none
+        return strings.parse_i64(self.slice(node.text_start, node.text_length))
+
+    ## A number as a 64-bit float, or none.
+    pub func number() -> f64?:
+        let node = self.document.pool[self.index]
+        if node.kind != Kind.number:
+            return none
+        return strings.parse_f64(self.slice(node.text_start, node.text_length)) catch _: recover none
+
+    ## The raw source text of a number, or none.
+    pub func number_text() -> str?:
+        let node = self.document.pool[self.index]
+        if node.kind != Kind.number:
+            return none
+        return self.slice(node.text_start, node.text_length)
+
+    func slice(start: usize, length: usize) -> str:
+        return (str)self.document.storage.storage[start..<start + length]
+
+# mark: The parser ============================================================================
+
+## A cursor over the input while it decodes into a document.
+struct Parser:
+    var input: const u8[]
+    var offset: usize
+    var document: Document*
+    var depth: u32
+
+    func peek() -> u8:
+        return self.input[self.offset] if self.offset < self.input.length else 0
+
+    mutating func skip_whitespace():
+        while self.offset < self.input.length:
+            let byte = self.input[self.offset]
+            if byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r':
+                self.offset += 1
+            else:
+                break
+
+    mutating func parse_document() -> !:
+        self.skip_whitespace()
+        discard(try self.parse_value())
+        self.skip_whitespace()
+        if self.offset < self.input.length:
+            error(invalid, "trailing characters after the JSON value")
+
+    mutating func parse_value() -> usize!:
+        self.depth += 1
+        if self.depth > 128:
+            error(invalid, "JSON nests too deeply")
+        self.skip_whitespace()
+        let byte = self.peek()
+        var index: usize
+        if byte == '{':
+            index = try self.parse_object()
+        elif byte == '[':
+            index = try self.parse_array()
+        elif byte == '"':
+            index = try self.parse_text()
+        elif byte == 't' or byte == 'f':
+            index = try self.parse_boolean()
+        elif byte == 'n':
+            index = try self.parse_null()
+        elif byte == '-' or (byte >= '0' and byte <= '9'):
+            index = try self.parse_number()
+        else:
+            error(invalid, "unexpected character in JSON")
+        self.depth -= 1
+        return index
+
+    mutating func parse_object() -> usize!:
+        let index = try self.document.add(Element(kind = Kind.object))
+        self.offset += 1
+        self.skip_whitespace()
+        var count: usize = 0
+        var last: usize = 0
+        var linked = false
+        if self.peek() == '}':
+            self.offset += 1
+        else:
+            while true:
+                self.skip_whitespace()
+                if self.peek() != '"':
+                    error(invalid, "a JSON object key must be a string")
+                let key = try self.parse_string_bytes()
+                self.skip_whitespace()
+                if self.peek() != ':':
+                    error(invalid, "a JSON object member needs a colon")
+                self.offset += 1
+                let child = try self.parse_value()
+                self.document.pool[child].key_start = key.start
+                self.document.pool[child].key_length = key.length
+                if linked:
+                    self.document.pool[last].next_sibling = child
+                    self.document.pool[last].has_sibling = true
+                else:
+                    self.document.pool[index].first_child = child
+                    self.document.pool[index].has_child = true
+                last = child
+                linked = true
+                count += 1
+                self.skip_whitespace()
+                let separator = self.peek()
+                if separator == ',':
+                    self.offset += 1
+                elif separator == '}':
+                    self.offset += 1
+                    break
+                else:
+                    error(invalid, "a JSON object needs a comma or a closing brace")
+        self.document.pool[index].count = count
+        return index
+
+    mutating func parse_array() -> usize!:
+        let index = try self.document.add(Element(kind = Kind.array))
+        self.offset += 1
+        self.skip_whitespace()
+        var count: usize = 0
+        var last: usize = 0
+        var linked = false
+        if self.peek() == ']':
+            self.offset += 1
+        else:
+            while true:
+                let child = try self.parse_value()
+                if linked:
+                    self.document.pool[last].next_sibling = child
+                    self.document.pool[last].has_sibling = true
+                else:
+                    self.document.pool[index].first_child = child
+                    self.document.pool[index].has_child = true
+                last = child
+                linked = true
+                count += 1
+                self.skip_whitespace()
+                let separator = self.peek()
+                if separator == ',':
+                    self.offset += 1
+                elif separator == ']':
+                    self.offset += 1
+                    break
+                else:
+                    error(invalid, "a JSON array needs a comma or a closing bracket")
+        self.document.pool[index].count = count
+        return index
+
+    mutating func parse_text() -> usize!:
+        let bytes = try self.parse_string_bytes()
+        return try self.document.add(Element(kind = Kind.string, text_start = bytes.start, text_length = bytes.length))
+
+    mutating func parse_boolean() -> usize!:
+        if self.matches("true"):
+            return try self.document.add(Element(kind = Kind.boolean, boolean = true))
+        if self.matches("false"):
+            return try self.document.add(Element(kind = Kind.boolean, boolean = false))
+        error(invalid, "an invalid JSON literal")
+
+    mutating func parse_null() -> usize!:
+        if self.matches("null"):
+            return try self.document.add(Element(kind = Kind.null))
+        error(invalid, "an invalid JSON literal")
+
+    mutating func matches(word: str) -> bool:
+        if self.offset + word.length > self.input.length:
+            return false
+        var index: usize = 0
+        while index < word.length:
+            if self.input[self.offset + index] != word.bytes[index]:
+                return false
+            index += 1
+        self.offset += word.length
+        return true
+
+    mutating func parse_number() -> usize!:
+        let start = self.offset
+        if self.peek() == '-':
+            self.offset += 1
+        if self.peek() == '0':
+            self.offset += 1
+        elif self.peek() >= '1' and self.peek() <= '9':
+            while self.is_digit(self.peek()):
+                self.offset += 1
+        else:
+            error(invalid, "a JSON number needs a digit")
+        if self.peek() == '.':
+            self.offset += 1
+            if not self.is_digit(self.peek()):
+                error(invalid, "a JSON fraction needs a digit")
+            while self.is_digit(self.peek()):
+                self.offset += 1
+        if self.peek() == 'e' or self.peek() == 'E':
+            self.offset += 1
+            if self.peek() == '+' or self.peek() == '-':
+                self.offset += 1
+            if not self.is_digit(self.peek()):
+                error(invalid, "a JSON exponent needs a digit")
+            while self.is_digit(self.peek()):
+                self.offset += 1
+        let where = self.document.storage.used
+        try self.document.storage.append(self.input[start..<self.offset], self.document.maximum)
+        return try self.document.add(Element(kind = Kind.number, text_start = where, text_length = self.document.storage.used - where))
+
+    func is_digit(byte: u8) -> bool:
+        return byte >= '0' and byte <= '9'
+
+    ## Parse a "..."-delimited string, writing its unescaped UTF-8 into the document's
+    ## storage, and answer the byte range it occupies.
+    mutating func parse_string_bytes() -> TextSpan!:
+        self.offset += 1
+        let start = self.document.storage.used
+        while true:
+            if self.offset >= self.input.length:
+                error(invalid, "an unterminated JSON string")
+            let byte = self.input[self.offset]
+            if byte == '"':
+                self.offset += 1
+                break
+            elif byte == '\\':
+                self.offset += 1
+                try self.parse_escape()
+            elif byte < 32:
+                error(invalid, "a control character in a JSON string")
+            else:
+                let single: u8[1] = [byte]
+                try self.document.storage.append(single, self.document.maximum)
+                self.offset += 1
+        return TextSpan(start = start, length = self.document.storage.used - start)
+
+    mutating func parse_escape() -> !:
+        if self.offset >= self.input.length:
+            error(invalid, "an unterminated JSON escape")
+        let escape = self.input[self.offset]
+        self.offset += 1
+        if escape == '"' or escape == '\\' or escape == '/':
+            try self.emit(escape)
+        elif escape == 'b':
+            try self.emit(8)
+        elif escape == 'f':
+            try self.emit(12)
+        elif escape == 'n':
+            try self.emit(10)
+        elif escape == 'r':
+            try self.emit(13)
+        elif escape == 't':
+            try self.emit(9)
+        elif escape == 'u':
+            try self.parse_unicode_escape()
+        else:
+            error(invalid, "an unknown JSON escape")
+
+    mutating func emit(byte: u8) -> !:
+        let single: u8[1] = [byte]
+        try self.document.storage.append(single, self.document.maximum)
+
+    mutating func parse_unicode_escape() -> !:
+        let high = try self.read_hex4()
+        var scalar = high
+        if high >= 0xD800 and high <= 0xDBFF:
+            if self.offset + 1 >= self.input.length or self.input[self.offset] != '\\' or self.input[self.offset + 1] != 'u':
+                error(invalid, "a JSON high surrogate needs a following low surrogate")
+            self.offset += 2
+            let low = try self.read_hex4()
+            if low < 0xDC00 or low > 0xDFFF:
+                error(invalid, "a JSON low surrogate is out of range")
+            scalar = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+        elif high >= 0xDC00 and high <= 0xDFFF:
+            error(invalid, "a lone JSON low surrogate")
+        var buffer: u8[4]
+        let width = utf8.encode(scalar, buffer) else error(invalid, "an invalid JSON scalar value")
+        try self.document.storage.append(buffer[..<width], self.document.maximum)
+
+    mutating func read_hex4() -> u32!:
+        if self.offset + 4 > self.input.length:
+            error(invalid, "a truncated JSON unicode escape")
+        var value: u32 = 0
+        var index: usize = 0
+        while index < 4:
+            let digit = hex_digit(self.input[self.offset + index]) else error(invalid, "a bad hex digit in a JSON unicode escape")
+            value = (value << 4) | digit
+            index += 1
+        self.offset += 4
+        return value
+
+## The byte range one decoded string occupies in a document's storage.
+struct TextSpan:
+    var start: usize
+    var length: usize
+
+func hex_digit(byte: u8) -> u32?:
+    if byte >= '0' and byte <= '9':
+        return (u32)(byte - '0')
+    if byte >= 'a' and byte <= 'f':
+        return (u32)(byte - 'a') + 10
+    if byte >= 'A' and byte <= 'F':
+        return (u32)(byte - 'A') + 10
+    return none
+
+## Decode `input` into a document. Fails with `invalid` on malformed JSON and
+## `limit_exceeded` when the decoded bytes would pass `maximum_bytes`.
+pub func decode(input: str, maximum_bytes: usize = 1048576) -> interop.Reference[Document]!:
+    if maximum_bytes < 2 or maximum_bytes > 67108864:
+        error(invalid, "JSON byte limit must be between 2 and 64 MiB")
+    if input.length > maximum_bytes:
+        error(limit_exceeded, "JSON input exceeds its configured byte limit")
+    let native = try new Document() in memory.heap
+    native.maximum = maximum_bytes
+    var parser = Parser(input = input.bytes, offset = 0, document = native, depth = 0)
+    parser.parse_document() catch failure:
+        native.close()
+        free(native) in memory.heap
+        error(failure.code, failure.message)
+    return try Document.own(native)
+
+# mark: Tests =================================================================================
+
+test "decode reads the scalar kinds and their values":
+    with memory.heap:
+        let doc = try decode("42")
+        defer doc.release()
+        let root = (try doc.get()).root()
+        assert(root.kind() == Kind.number)
+        assert((root.integer() else -1) == 42)
+        assert((root.number() else 0.0) == 42.0)
+
+        let flag = try decode("true")
+        defer flag.release()
+        assert((try flag.get()).root().kind() == Kind.boolean)
+        assert(((try flag.get()).root().boolean() else false))
+
+        let empty = try decode("null")
+        defer empty.release()
+        assert((try empty.get()).root().is_null())
+
+        let word = try decode("\"hi\"")
+        defer word.release()
+        assert(((try word.get()).root().text() else "") == "hi")
+
+test "decode reads an object and looks members up by name in any order":
+    with memory.heap:
+        let doc = try decode("{\"count\":42,\"ready\":true,\"name\":\"jo\",\"ratio\":1.5}")
+        defer doc.release()
+        let root = (try doc.get()).root()
+        assert(root.kind() == Kind.object)
+        assert(root.length() == 4)
+        assert(((root.member("count") else trap("count")).integer() else -1) == 42)
+        assert((root.member("ready") else trap("ready")).boolean() else false)
+        assert(((root.member("name") else trap("name")).text() else "") == "jo")
+        assert(((root.member("ratio") else trap("ratio")).number() else 0.0) == 1.5)
+        assert(root.member("absent") == none)
+
+test "decode reads a nested array and indexes it":
+    with memory.heap:
+        let doc = try decode("[1, [2, 3], \"x\", false, null]")
+        defer doc.release()
+        let root = (try doc.get()).root()
+        assert(root.kind() == Kind.array and root.length() == 5)
+        assert(((root.at(0) else trap("0")).integer() else -1) == 1)
+        let inner = root.at(1) else trap("1")
+        assert(inner.kind() == Kind.array and inner.length() == 2)
+        assert(((inner.at(1) else trap("1.1")).integer() else -1) == 3)
+        assert(((root.at(2) else trap("2")).text() else "") == "x")
+        assert(not ((root.at(3) else trap("3")).boolean() else true))
+        assert((root.at(4) else trap("4")).is_null())
+        assert(root.at(5) == none)
+
+test "decode unescapes strings, including \\u escapes and surrogate pairs":
+    with memory.heap:
+        let doc = try decode("[\"a\\\"b\", \"tab\\there\", \"\\u0041\\u00e9\", \"\\uD83D\\uDE00\"]")
+        defer doc.release()
+        let root = (try doc.get()).root()
+        assert(((root.at(0) else trap("0")).text() else "") == "a\"b")
+        assert(((root.at(1) else trap("1")).text() else "") == "tab\there")
+        assert(((root.at(2) else trap("2")).text() else "") == "Aé")
+        # U+1F600 GRINNING FACE encodes to four UTF-8 bytes
+        let grin: u8[4] = [0xF0, 0x9F, 0x98, 0x80]
+        assert(((root.at(3) else trap("3")).text() else "") == (str)grin[0..])
+
+test "encode then decode round-trips a built object":
+    with memory.heap:
+        let obj = try new Value()
+        defer free(obj)
+        defer obj.close()
+        try obj.set_integer("count", 42)
+        try obj.set_boolean("ready", true)
+        try obj.set_text("name", "jo")
+        let encoded = obj.encode()
+        assert(encoded == "{\"count\":42,\"ready\":true,\"name\":\"jo\"}")
+        let doc = try decode(encoded)
+        defer doc.release()
+        let root = (try doc.get()).root()
+        assert(((root.member("count") else trap("count")).integer() else -1) == 42)
+        assert((root.member("ready") else trap("ready")).boolean() else false)
+        assert(((root.member("name") else trap("name")).text() else "") == "jo")
+
+func expect_invalid(text: str) -> !:
+    let doc = try decode(text)
+    doc.release()
+
+func expect_over_limit(text: str, limit: usize) -> !:
+    let doc = try decode(text, limit)
+    doc.release()
+
+test "decode rejects malformed input with an invalid error":
+    with memory.heap:
+        var bad = 0
+        for text in ["", "{", "[1,]", "{\"a\":}", "tr(ue", "1.", "01", "\"open", "{\"a\":1} x", "[1 2]", "\"\\q\""]:
+            expect_invalid(text) catch failure:
+                assert(failure.code == invalid)
+                bad += 1
+        assert(bad == 11)
+
+test "decode refuses input past its byte limit":
+    with memory.heap:
+        var over = false
+        expect_over_limit("[1,2,3,4,5]", 4) catch failure:
+            assert(failure.code == limit_exceeded)
+            over = true
+        assert(over)

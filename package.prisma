@@ -1,0 +1,12 @@
+#prisma 4.0
+def package "luce-json" {
+    str owner = "dymokomi"
+    str version = "0.2.0"
+    str language = "luce-base"
+    str description = "Structured JSON encoding and decoding for Luce and luce-base. A standalone package: it depends only on the embedded standard library (memory, interop, strings, utf8, math)."
+    str readme = "README.md"
+
+    def export "json" {
+        str module = "luce_json.json"
+    }
+}

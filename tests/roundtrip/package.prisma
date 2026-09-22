@@ -1,0 +1,6 @@
+#prisma 4.0
+def package "roundtrip" {
+    def dependency "luce_json" {
+        str path = "../.."
+    }
+}

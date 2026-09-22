@@ -1,5 +1,0 @@
-[package]
-name = "roundtrip"
-
-[dependencies]
-luce_json = "../.."

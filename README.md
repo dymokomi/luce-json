@@ -17,7 +17,7 @@ luce_json = "../luce-json"
 ```
 
 ```luce
-import luce_json.json
+from luce_json import json
 import memory
 
 pub func main(arguments: str[]) -> i32!:

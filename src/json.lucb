@@ -12,8 +12,8 @@
 import memory
 import interop
 import strings
-import utf8
-import math
+import luce_std.utf8
+import luce_std.math
 ## A JSON operation with an invalid argument or shape.
 pub let invalid: ErrorCode = ErrorCode.package(110)
 ## A JSON value grown past its configured byte limit.

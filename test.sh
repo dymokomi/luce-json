@@ -8,9 +8,9 @@ LUCE_BASE=${LUCE_BASE:-../luce-base/build/luce-base}
 [ -x "$LUCE_BASE" ] || LUCE_BASE=luce-base
 mkdir -p build
 echo "== module unit tests (c backend)"
-"$LUCE_BASE" test src/luce_json/json.lucb --backend=c
+"$LUCE_BASE" test src/json.lucb --backend=c
 echo "== module unit tests (native backend)"
-"$LUCE_BASE" test src/luce_json/json.lucb --native
+"$LUCE_BASE" test src/json.lucb --native
 expected='{"count":42,"name":"luce"}
 count=42 name=luce'
 for mode in --backend=c --native; do

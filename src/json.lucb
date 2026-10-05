@@ -95,18 +95,18 @@ pub struct Value:
         self.maximum = maximum_bytes
         try self.encoded.append(b"{}", self.maximum)
 
-    func own(native: Value*) -> interop.Reference[Value]!:
+    static func own(native: Value*) -> interop.Reference[Value]!:
         return try interop.Reference[Value].adopt(native, value_type)
 
     ## An empty JSON array value.
-    pub func array(maximum_bytes: usize = 1048576) -> interop.Reference[Value]!:
+    pub static func array(maximum_bytes: usize = 1048576) -> interop.Reference[Value]!:
         let native = try new Value(maximum_bytes)
         native.container = '['
         native.encoded.storage[0] = '['
         native.encoded.storage[1] = ']'
         return try Value.own(native)
 
-    func scalar(data: str) -> interop.Reference[Value]!:
+    static func scalar(data: str) -> interop.Reference[Value]!:
         let native = try new Value()
         native.encoded.used = 0
         native.container = 0
@@ -117,30 +117,30 @@ pub struct Value:
         return try Value.own(native)
 
     ## A JSON string value.
-    pub func text(value: str) -> interop.Reference[Value]!:
+    pub static func text(value: str) -> interop.Reference[Value]!:
         var bytes: Bytes
         defer bytes.close()
         try quoted(value, &bytes, 1048576)
         return try Value.scalar((str)bytes.view())
 
     ## A JSON integer value.
-    pub func integer(value: i64) -> interop.Reference[Value]!:
+    pub static func integer(value: i64) -> interop.Reference[Value]!:
         var buffer: u8[32]
         return try Value.scalar(try strings.format(buffer, f"{value}"))
 
     ## A JSON number value; `value` must be finite.
-    pub func number(value: f64) -> interop.Reference[Value]!:
+    pub static func number(value: f64) -> interop.Reference[Value]!:
         if not math.is_finite(value):
             error(invalid, "JSON numbers must be finite")
         var buffer: u8[64]
         return try Value.scalar(try strings.format_f64(value, buffer))
 
     ## A JSON boolean value.
-    pub func boolean(value: bool) -> interop.Reference[Value]!:
+    pub static func boolean(value: bool) -> interop.Reference[Value]!:
         return try Value.scalar("true" if value else "false")
 
     ## The JSON null value.
-    pub func null() -> interop.Reference[Value]!:
+    pub static func null() -> interop.Reference[Value]!:
         return try Value.scalar("null")
 
     ## Borrowed until the next mutation or close; Luce copies the result.
@@ -261,7 +261,7 @@ pub struct Document:
     var used: usize = 0
     var maximum: usize = 1048576
 
-    func own(native: Document*) -> interop.Reference[Document]!:
+    static func own(native: Document*) -> interop.Reference[Document]!:
         return try interop.Reference[Document].adopt(native, document_type)
 
     ## The root value of the document.
@@ -592,7 +592,7 @@ struct Parser:
         try self.document.storage.append(self.input[start..<self.offset], self.document.maximum)
         return try self.document.add(Element(kind = Kind.number, text_start = where, text_length = self.document.storage.used - where))
 
-    func is_digit(byte: u8) -> bool:
+    static func is_digit(byte: u8) -> bool:
         return byte >= '0' and byte <= '9'
 
     ## Parse a "..."-delimited string, writing its unescaped UTF-8 into the document's

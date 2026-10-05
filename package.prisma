@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-json" {
     str owner = "dymokomi"
-    str version = "0.4.0"
+    str version = "0.5.0"
     str kind = "package"
     str language = "luce-base"
     str description = "Structured JSON encoding and decoding for Luce and luce-base. A standalone package: it depends only on the embedded standard library (memory, interop, strings, utf8, math)."
@@ -10,7 +10,7 @@ def package "luce-json" {
 
     def dependency "luce-std" {
         str owner = "dymokomi"
-        str version = "^0.4.0"
+        str version = "^0.5.0"
         str path = "../luce-std"
     }
 }

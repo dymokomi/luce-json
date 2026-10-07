@@ -68,8 +68,8 @@ Views are borrowed and valid until the document closes. Malformed input fails wi
 
 ## Test
 
-`./test.sh` runs the unit tests through both backends and a consumer round-trip. Set
-`LUCE_BASE` to your compiler; it defaults to a sibling `../luce-base` checkout.
+`luc test` runs the unit tests and `tests/roundtrip`, a consumer that must print its
+`expected` file.
 
 ## License
 
